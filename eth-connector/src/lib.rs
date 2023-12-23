@@ -2,13 +2,14 @@
 #![allow(clippy::module_name_repetitions)]
 use crate::admin_controlled::{AdminControlled, PausedMask, PAUSE_WITHDRAW, UNPAUSE_ALL};
 use crate::connector::{
-    Deposit, EngineConnectorWithdraw, EngineFungibleToken, EngineStorageManagement, FundsFinish,
-    KnownEngineAccountsManagement, Withdraw,
+    Deposit, EngineConnectorWithdraw, EngineFungibleToken, EngineStorageManagement, FeeManagement,
+    FundsFinish, KnownEngineAccountsManagement, Withdraw,
 };
 use crate::connector_impl::{
     EthConnector, FinishDepositCallArgs, TransferCallCallArgs, WithdrawResult,
 };
 use crate::deposit_event::FtTransferMessageData;
+use crate::fee::{Fee, FeeStorage, FeeType};
 use crate::proof::{Proof, VerifyProofArgs};
 use crate::types::{panic_err, SdkUnwrap};
 use aurora_engine_types::types::Address;
@@ -19,6 +20,7 @@ use near_contract_standards::fungible_token::metadata::{
 use near_contract_standards::fungible_token::receiver::ext_ft_receiver;
 use near_contract_standards::fungible_token::resolver::{ext_ft_resolver, FungibleTokenResolver};
 use near_contract_standards::fungible_token::FungibleToken;
+use near_sdk::collections::UnorderedMap;
 use near_sdk::{
     assert_one_yocto,
     borsh::{self, BorshDeserialize, BorshSerialize},
@@ -34,13 +36,16 @@ pub mod connector;
 pub mod connector_impl;
 pub mod deposit_event;
 pub mod errors;
+pub mod fee;
 pub mod log_entry;
 pub mod migration;
 pub mod proof;
+pub mod storage_migration;
 pub mod types;
 
 const GAS_FOR_RESOLVE_TRANSFER: Gas = Gas(5 * Gas::ONE_TERA.0);
 const GAS_FOR_FT_TRANSFER_CALL: Gas = Gas(25 * Gas::ONE_TERA.0 + GAS_FOR_RESOLVE_TRANSFER.0);
+const FEE_DECIMAL_PRECISION: u128 = 1_000_000; // Fee can be set in 6 decimal precision (10% -> 0.1 * 10e6)
 
 /// Eth-connector contract data. It's stored in the storage.
 /// Contains:
@@ -55,6 +60,7 @@ pub struct EthConnectorContract {
     metadata: LazyOption<FungibleTokenMetadata>,
     used_proofs: LookupSet<String>,
     known_engine_accounts: LookupSet<AccountId>,
+    fee: FeeStorage,
 }
 
 #[derive(BorshSerialize, BorshStorageKey)]
@@ -63,11 +69,17 @@ enum StorageKey {
     Proof = 0x2,
     Metadata = 0x3,
     EngineAccounts = 0x4,
+    WithdrawFeePerSilo = 0x5,
+    DespositFeePerSilo = 0x6,
 }
 
 impl EthConnectorContract {
     ///  Mint `nETH` tokens
     fn mint_eth_on_near(&mut self, owner_id: &AccountId, amount: Balance) {
+        if amount == 0 {
+            return;
+        }
+
         log!("Mint {} nETH tokens for: {}", amount, owner_id);
         // Create account to avoid panic with deposit
         self.register_if_not_exists(owner_id);
@@ -188,6 +200,11 @@ impl EthConnectorContract {
             metadata: LazyOption::new(StorageKey::Metadata, Some(metadata)),
             used_proofs: LookupSet::new(StorageKey::Proof),
             known_engine_accounts: LookupSet::new(StorageKey::EngineAccounts),
+            fee: FeeStorage {
+                deposit_fee_per_silo: UnorderedMap::new(StorageKey::DespositFeePerSilo),
+                withdraw_fee_per_silo: UnorderedMap::new(StorageKey::WithdrawFeePerSilo),
+                fee_owner: None,
+            },
         };
         this.register_if_not_exists(&env::current_account_id());
         this.register_if_not_exists(owner_id);
@@ -212,6 +229,16 @@ impl EthConnectorContract {
     #[must_use]
     pub fn get_bridge_prover(&self) -> AccountId {
         self.connector.prover_account.clone()
+    }
+
+    #[init(ignore_state)]
+    #[must_use]
+    pub fn migrate_fee_storage() -> Self {
+        let old_state: storage_migration::EthConnectorContractV0 =
+            env::state_read().expect("Failed to read the storage");
+
+        old_state.connector.assert_owner_access_right().sdk_unwrap();
+        old_state.into()
     }
 }
 
@@ -498,8 +525,22 @@ impl Withdraw for EthConnectorContract {
         let sender_id = env::predecessor_account_id();
         // Burn tokens to recipient
         self.ft.internal_withdraw(&sender_id, amount);
+
+        let fee_amount = self
+            .calculate_fee_amount(amount.into(), FeeType::Withdraw, Some(sender_id))
+            .0;
+        // Mint fee
+        self.mint_eth_on_near(&self.get_fee_owner(), fee_amount);
+
+        let withdraw_amount = amount.checked_sub(fee_amount).sdk_unwrap();
+
+        log!(
+            "withdraw_amount: {}, fee_amount: {}",
+            withdraw_amount,
+            fee_amount
+        );
         WithdrawResult {
-            amount,
+            amount: withdraw_amount,
             recipient_id: recipient_address,
             eth_custodian_address: self.connector.eth_custodian_address,
         }
@@ -525,8 +566,22 @@ impl EngineConnectorWithdraw for EthConnectorContract {
             .sdk_unwrap();
         // Burn tokens to recipient
         self.ft.internal_withdraw(&sender_id, amount);
+
+        let fee_amount = self
+            .calculate_fee_amount(amount.into(), FeeType::Withdraw, Some(sender_id))
+            .0;
+        // Mint fee
+        self.mint_eth_on_near(&self.get_fee_owner(), fee_amount);
+
+        let withdraw_amount = amount.checked_sub(fee_amount).sdk_unwrap();
+
+        log!(
+            "withdraw_amount: {}, fee_amount: {}",
+            withdraw_amount,
+            fee_amount
+        );
         WithdrawResult {
-            amount,
+            amount: withdraw_amount,
             recipient_id: recipient_address,
             eth_custodian_address: self.connector.eth_custodian_address,
         }
@@ -537,6 +592,83 @@ impl EngineConnectorWithdraw for EthConnectorContract {
 impl Deposit for EthConnectorContract {
     fn deposit(&mut self, #[serializer(borsh)] proof: Proof) -> Promise {
         self.connector.deposit(proof)
+    }
+}
+
+#[near_bindgen]
+impl FeeManagement for EthConnectorContract {
+    fn get_deposit_fee_per_silo(&self, silo: Option<AccountId>) -> Option<Fee> {
+        self.fee.deposit_fee_per_silo.get(&silo)
+    }
+
+    fn get_withdraw_fee_per_silo(&self, silo: Option<AccountId>) -> Option<Fee> {
+        self.fee.withdraw_fee_per_silo.get(&silo)
+    }
+
+    fn get_fee_owner(&self) -> AccountId {
+        self.fee
+            .fee_owner
+            .clone()
+            .unwrap_or_else(env::current_account_id)
+    }
+
+    fn calculate_fee_amount(
+        &self,
+        amount: U128,
+        fee_type: FeeType,
+        silo: Option<AccountId>,
+    ) -> U128 {
+        let Some(fee) = (match fee_type {
+            FeeType::Deposit => silo.and_then(|silo| self.fee.deposit_fee_per_silo.get(&Some(silo)))
+                                    .or_else(|| self.fee.deposit_fee_per_silo.get(&None)),
+            FeeType::Withdraw => silo.and_then(|silo| self.fee.withdraw_fee_per_silo.get(&Some(silo)))
+                                     .or_else(|| self.fee.withdraw_fee_per_silo.get(&None)),
+        }) else { return 0.into() };
+
+        let fee_amount =
+            amount.0.checked_mul(fee.fee_percentage.into()).sdk_unwrap() / FEE_DECIMAL_PRECISION;
+
+        let bounded_fee_amount = if fee.lower_bound.map_or(false, |bound| fee_amount < bound.0) {
+            fee.lower_bound.unwrap().0
+        } else if fee.upper_bound.map_or(false, |bound| fee_amount > bound.0) {
+            fee.upper_bound.unwrap().0
+        } else {
+            fee_amount
+        };
+
+        U128(std::cmp::min(bounded_fee_amount, amount.0))
+    }
+
+    fn set_deposit_fee_per_silo(&mut self, silo: Option<AccountId>, fee: Option<Fee>) {
+        self.connector.assert_owner_access_right().sdk_unwrap();
+        if let Some(fee) = fee {
+            self.fee.deposit_fee_per_silo.insert(&silo, &fee);
+        } else {
+            self.fee.deposit_fee_per_silo.remove(&silo);
+        }
+    }
+
+    fn set_withdraw_fee_per_silo(&mut self, silo: Option<AccountId>, fee: Option<Fee>) {
+        self.connector.assert_owner_access_right().sdk_unwrap();
+        if let Some(fee) = fee {
+            self.fee.withdraw_fee_per_silo.insert(&silo, &fee);
+        } else {
+            self.fee.withdraw_fee_per_silo.remove(&silo);
+        }
+    }
+
+    fn set_fee_owner(&mut self, owner: Option<AccountId>) {
+        self.connector.assert_owner_access_right().sdk_unwrap();
+        self.fee.fee_owner = owner;
+    }
+
+    fn claim_fee(&mut self, amount: U128, receiver_id: Option<AccountId>) {
+        self.connector.assert_owner_access_right().sdk_unwrap();
+        self.ft_transfer(
+            receiver_id.unwrap_or_else(env::predecessor_account_id),
+            amount,
+            None,
+        );
     }
 }
 
@@ -556,31 +688,68 @@ impl FundsFinish for EthConnectorContract {
 
         log!("Finish deposit with the amount: {}", deposit_call.amount);
 
-        // Mint - calculate new balances
-        self.mint_eth_on_near(&deposit_call.new_owner_id, deposit_call.amount);
-        // Store proof only after `mint` calculations
+        // Store the proof key
         self.record_proof(&deposit_call.proof_key).sdk_unwrap();
 
-        // Mint tokens to recipient minus fee
-        deposit_call.msg.map_or_else(
-            || PromiseOrValue::Value(None),
-            |msg| {
-                let args = TransferCallCallArgs::try_from_slice(&msg)
-                    .map_err(|_| crate::errors::ERR_BORSH_DESERIALIZE)
-                    .sdk_unwrap();
-                let promise = self.internal_ft_transfer_call(
-                    env::predecessor_account_id(),
-                    args.receiver_id,
-                    args.amount.into(),
-                    args.memo,
-                    args.msg,
-                );
-                match promise {
-                    PromiseOrValue::Promise(p) => PromiseOrValue::Promise(p),
-                    PromiseOrValue::Value(v) => PromiseOrValue::Value(Some(v)),
-                }
-            },
-        )
+        if let Some(msg) = deposit_call.msg {
+            // Transfer tokens to recipient minus fee
+            let args = TransferCallCallArgs::try_from_slice(&msg)
+                .map_err(|_| crate::errors::ERR_BORSH_DESERIALIZE)
+                .sdk_unwrap();
+
+            let fee_amount = self
+                .calculate_fee_amount(
+                    deposit_call.amount.into(),
+                    FeeType::Deposit,
+                    Some(args.receiver_id.clone()),
+                )
+                .0;
+            let amount_to_transfer = deposit_call.amount.checked_sub(fee_amount).sdk_unwrap();
+
+            log!(
+                "deposit_amount: {}, fee_amount: {}",
+                amount_to_transfer,
+                fee_amount
+            );
+
+            // Mint - calculate new balances
+            self.mint_eth_on_near(&self.get_fee_owner(), fee_amount);
+            self.mint_eth_on_near(&env::current_account_id(), amount_to_transfer);
+
+            // Early return if the fee is higher than the transferred amount
+            if amount_to_transfer == 0 && fee_amount != 0 {
+                return PromiseOrValue::Value(Some(U128(0)));
+            }
+
+            let promise = self.internal_ft_transfer_call(
+                env::current_account_id(),
+                args.receiver_id,
+                amount_to_transfer.into(),
+                args.memo,
+                args.msg,
+            );
+            match promise {
+                PromiseOrValue::Promise(p) => PromiseOrValue::Promise(p),
+                PromiseOrValue::Value(v) => PromiseOrValue::Value(Some(v)),
+            }
+        } else {
+            let fee_amount = self
+                .calculate_fee_amount(deposit_call.amount.into(), FeeType::Deposit, None)
+                .0;
+            let deposit_amount = deposit_call.amount.checked_sub(fee_amount).sdk_unwrap();
+
+            log!(
+                "deposit_amount: {}, fee_amount: {}",
+                deposit_amount,
+                fee_amount
+            );
+
+            // Mint - calculate new balances
+            self.mint_eth_on_near(&self.get_fee_owner(), fee_amount);
+            self.mint_eth_on_near(&deposit_call.new_owner_id, deposit_amount);
+
+            PromiseOrValue::Value(None)
+        }
     }
 }
 
@@ -693,7 +862,64 @@ impl FungibleTokenReceiver for EthConnectorContract {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+
+    use near_sdk::test_utils::VMContextBuilder;
+    use near_sdk::testing_env;
+
+    macro_rules! inner_set_env {
+        ($builder:ident) => {
+            $builder
+        };
+
+        ($builder:ident, $key:ident:$value:expr $(,$key_tail:ident:$value_tail:expr)*) => {
+            {
+               $builder.$key($value.try_into().unwrap());
+               inner_set_env!($builder $(,$key_tail:$value_tail)*)
+            }
+        };
+    }
+
+    macro_rules! set_env {
+        ($($key:ident:$value:expr),* $(,)?) => {
+            let mut builder = VMContextBuilder::new();
+            let mut builder = &mut builder;
+            builder = inner_set_env!(builder, $($key: $value),*);
+            testing_env!(builder.build());
+        };
+    }
+
+    fn owner() -> AccountId {
+        "owner.near".parse().unwrap()
+    }
+
+    fn engine() -> AccountId {
+        "engine.near".parse().unwrap()
+    }
+
+    fn prover() -> AccountId {
+        "prover.near".parse().unwrap()
+    }
+
+    fn eth_connector() -> AccountId {
+        "eth_connector".parse().unwrap()
+    }
+
+    fn ft_owner() -> AccountId {
+        "ft_owner".parse().unwrap()
+    }
+
+    fn fee_owner() -> AccountId {
+        "fee_owner".parse().unwrap()
+    }
+
+    const fn eth_custodian() -> Address {
+        Address::from_array([0xab; 20])
+    }
+    const fn recipient_address() -> Address {
+        Address::from_array([0xef; 20])
+    }
 
     /// In the original implementation of the eth-connector contract the storage balance
     /// was always 0. This test confirms this is true for the new implementation.
@@ -707,9 +933,374 @@ mod tests {
         assert_eq!(storage_balance.available.0, 0);
     }
 
+    #[derive(Clone, Debug)]
+    struct TestFeeCase {
+        amount: u128,
+        fee: Option<Fee>,
+        expected_transferred_amount: u128,
+        expected_fee_amount: u128,
+    }
+
+    fn get_fee_test_cases() -> Vec<TestFeeCase> {
+        [
+            TestFeeCase {
+                amount: 100_000,
+                fee: Some(Fee {
+                    fee_percentage: 100_000, // 10%
+                    lower_bound: None,
+                    upper_bound: None,
+                }),
+                expected_transferred_amount: 90_000,
+                expected_fee_amount: 10_000,
+            },
+            TestFeeCase {
+                amount: 100_000,
+                fee: Some(Fee {
+                    fee_percentage: 100_000, // 10%
+                    lower_bound: Some(U128(20_000)),
+                    upper_bound: None,
+                }),
+                expected_transferred_amount: 80_000,
+                expected_fee_amount: 20_000,
+            },
+            TestFeeCase {
+                amount: 100_000,
+                fee: Some(Fee {
+                    fee_percentage: 200_000, // 20%
+                    lower_bound: None,
+                    upper_bound: Some(U128(10_000)),
+                }),
+                expected_transferred_amount: 90_000,
+                expected_fee_amount: 10_000,
+            },
+            TestFeeCase {
+                amount: 1000,
+                fee: Some(Fee {
+                    fee_percentage: 200_000, // 20%
+                    lower_bound: Some(U128(10_000)),
+                    upper_bound: None,
+                }),
+                expected_transferred_amount: 0,
+                expected_fee_amount: 1000,
+            },
+            TestFeeCase {
+                amount: 100_000,
+                fee: Some(Fee {
+                    fee_percentage: 0, // 0%
+                    lower_bound: None,
+                    upper_bound: None,
+                }),
+                expected_transferred_amount: 100_000,
+                expected_fee_amount: 0,
+            },
+            TestFeeCase {
+                amount: 100_000,
+                fee: None,
+                expected_transferred_amount: 100_000,
+                expected_fee_amount: 0,
+            },
+        ]
+        .to_vec()
+    }
+
+    fn test_withdraw_generic<F>(
+        withdraw_function: F,
+        ft_owner: &AccountId,
+        silo: &Option<AccountId>,
+        fee_owner: &Option<AccountId>,
+    ) where
+        F: Fn(&mut EthConnectorContract, &TestFeeCase) -> WithdrawResult,
+    {
+        set_env!(predecessor_account_id: owner(), current_account_id: eth_connector(), attached_deposit: 1);
+        let mut contract = create_contract();
+        contract.set_fee_owner(fee_owner.clone());
+        let fee_owner = fee_owner.clone().unwrap_or_else(eth_connector);
+
+        let mint_amount = 1_000_000_000_000_000_000_000;
+        contract.mint_eth_on_near(ft_owner, mint_amount);
+        let mut ft_owner_balance_before_withdraw = contract.ft_balance_of(ft_owner.clone()).0;
+        assert_eq!(
+            ft_owner_balance_before_withdraw, mint_amount,
+            "Wrong ft owner balance after mint"
+        );
+
+        let mut fee_owner_balance_before_withdraw = contract.ft_balance_of(fee_owner.clone()).0;
+        assert_eq!(
+            fee_owner_balance_before_withdraw, 0,
+            "Wrong eth-connector blanace after init"
+        );
+
+        for test_case in &get_fee_test_cases() {
+            set_env!(
+                predecessor_account_id: owner(),
+                current_account_id: eth_connector()
+            );
+
+            contract.set_withdraw_fee_per_silo(silo.clone(), test_case.fee);
+
+            let result = withdraw_function(&mut contract, test_case);
+            assert_eq!(
+                result,
+                WithdrawResult {
+                    amount: test_case.expected_transferred_amount,
+                    recipient_id: recipient_address(),
+                    eth_custodian_address: eth_custodian()
+                },
+                "Wrong withdraw result"
+            );
+
+            let ft_owner_balance_after_withdraw = contract.ft_balance_of(ft_owner.clone()).0;
+            assert_eq!(
+                ft_owner_balance_after_withdraw,
+                ft_owner_balance_before_withdraw - test_case.amount,
+                "Wrong ft owner balance after withdraw"
+            );
+            let fee_owner_balance_after_withdraw = contract.ft_balance_of(fee_owner.clone()).0;
+            assert_eq!(
+                fee_owner_balance_after_withdraw,
+                fee_owner_balance_before_withdraw + test_case.expected_fee_amount,
+                "Wrong eth-connector balance after withdraw"
+            );
+
+            ft_owner_balance_before_withdraw = ft_owner_balance_after_withdraw;
+            fee_owner_balance_before_withdraw = fee_owner_balance_after_withdraw;
+        }
+    }
+
+    #[test]
+    fn test_fee_on_withdraw() {
+        test_withdraw_generic(
+            |contract, test_case| {
+                set_env!(predecessor_account_id: ft_owner(), current_account_id: eth_connector(), attached_deposit: 1);
+                contract.withdraw(recipient_address(), test_case.amount)
+            },
+            &ft_owner(),
+            &None,
+            &None,
+        );
+    }
+
+    #[test]
+    fn test_fee_on_withdraw_per_silo() {
+        test_withdraw_generic(
+            |contract, test_case| {
+                set_env!(predecessor_account_id: engine(), current_account_id: eth_connector(), attached_deposit: 1);
+                contract.withdraw(recipient_address(), test_case.amount)
+            },
+            &engine(),
+            &Some(engine()),
+            &None,
+        );
+    }
+
+    #[test]
+    fn test_fee_on_engine_withdraw() {
+        test_withdraw_generic(
+            |contract, test_case| {
+                set_env!(predecessor_account_id: engine(), current_account_id: eth_connector(), attached_deposit: 1);
+                contract.engine_withdraw(ft_owner(), recipient_address(), test_case.amount)
+            },
+            &ft_owner(),
+            &None,
+            &None,
+        );
+    }
+
+    #[test]
+    fn test_fee_on_engine_withdraw_with_fee_owner() {
+        test_withdraw_generic(
+            |contract, test_case| {
+                set_env!(predecessor_account_id: engine(), current_account_id: eth_connector(), attached_deposit: 1);
+                contract.engine_withdraw(ft_owner(), recipient_address(), test_case.amount)
+            },
+            &ft_owner(),
+            &None,
+            &Some(fee_owner()),
+        );
+    }
+
+    #[test]
+    fn test_fee_on_engine_withdraw_per_silo() {
+        test_withdraw_generic(
+            |contract, test_case| {
+                set_env!(predecessor_account_id: engine(), current_account_id: eth_connector(), attached_deposit: 1);
+                contract.engine_withdraw(engine(), recipient_address(), test_case.amount)
+            },
+            &engine(),
+            &Some(engine()),
+            &None,
+        );
+    }
+
+    #[test]
+    fn test_fee_on_engine_withdraw_per_silo_with_fee_owner() {
+        test_withdraw_generic(
+            |contract, test_case| {
+                set_env!(predecessor_account_id: engine(), current_account_id: eth_connector(), attached_deposit: 1);
+                contract.engine_withdraw(engine(), recipient_address(), test_case.amount)
+            },
+            &engine(),
+            &Some(engine()),
+            &Some(fee_owner()),
+        );
+    }
+
+    fn test_fee_on_finish_deposit_generic<F>(
+        deposit_function: F,
+        ft_owner: &AccountId,
+        silo: &Option<AccountId>,
+        fee_owner: &Option<AccountId>,
+    ) where
+        F: Fn(&mut EthConnectorContract, &TestFeeCase, String),
+    {
+        set_env!(predecessor_account_id: owner(), current_account_id: eth_connector(), attached_deposit: 1);
+        let mut contract = create_contract();
+        contract.set_fee_owner(fee_owner.clone());
+        let fee_owner = fee_owner.clone().unwrap_or_else(eth_connector);
+
+        let mut ft_owner_balance_before_deposit = contract.ft_balance_of(ft_owner.clone()).0;
+        assert_eq!(
+            ft_owner_balance_before_deposit, 0,
+            "Wrong ft owner balance after mint"
+        );
+
+        let mut fee_owner_balance_before_deposit = contract.ft_balance_of(fee_owner.clone()).0;
+        assert_eq!(
+            fee_owner_balance_before_deposit, 0,
+            "Wrong eth connector blanace after init"
+        );
+
+        for test_case in &get_fee_test_cases() {
+            let proof_key = rand::distributions::DistString::sample_string(
+                &rand::distributions::Alphanumeric,
+                &mut rand::thread_rng(),
+                20,
+            );
+            set_env!(predecessor_account_id: owner(), current_account_id: eth_connector(), attached_deposit: 1);
+
+            contract.set_deposit_fee_per_silo(silo.clone(), test_case.fee);
+
+            deposit_function(&mut contract, test_case, proof_key);
+
+            let ft_owner_balance_after_deposit = contract.ft_balance_of(ft_owner.clone()).0;
+            assert_eq!(
+                ft_owner_balance_after_deposit,
+                ft_owner_balance_before_deposit + test_case.expected_transferred_amount,
+                "Wrong ft owner balance after deposit"
+            );
+            let fee_owner_balance_after_deposit = contract.ft_balance_of(fee_owner.clone()).0;
+            assert_eq!(
+                fee_owner_balance_after_deposit,
+                fee_owner_balance_before_deposit + test_case.expected_fee_amount,
+                "Wrong eth-connector balance after deposit"
+            );
+
+            ft_owner_balance_before_deposit = ft_owner_balance_after_deposit;
+            fee_owner_balance_before_deposit = fee_owner_balance_after_deposit;
+        }
+    }
+
+    #[test]
+    fn test_fee_on_finish_deposit() {
+        test_fee_on_finish_deposit_generic(
+            |contract, test_case, proof_key| {
+                contract.finish_deposit(
+                    FinishDepositCallArgs {
+                        new_owner_id: ft_owner(),
+                        amount: test_case.amount,
+                        proof_key,
+                        msg: None,
+                    },
+                    true,
+                );
+            },
+            &ft_owner(),
+            &None,
+            &None,
+        );
+    }
+
+    #[test]
+    fn test_fee_on_finish_deposit_with_fee_owner() {
+        test_fee_on_finish_deposit_generic(
+            |contract, test_case, proof_key| {
+                contract.finish_deposit(
+                    FinishDepositCallArgs {
+                        new_owner_id: ft_owner(),
+                        amount: test_case.amount,
+                        proof_key,
+                        msg: None,
+                    },
+                    true,
+                );
+            },
+            &ft_owner(),
+            &None,
+            &Some(fee_owner()),
+        );
+    }
+
+    #[test]
+    fn test_fee_on_finish_deposit_per_silo() {
+        test_fee_on_finish_deposit_generic(
+            |contract, test_case, proof_key| {
+                contract.finish_deposit(
+                    FinishDepositCallArgs {
+                        new_owner_id: engine(),
+                        amount: test_case.amount,
+                        proof_key,
+                        msg: Some(
+                            TransferCallCallArgs {
+                                receiver_id: engine(),
+                                amount: test_case.amount,
+                                memo: None,
+                                msg: "msg".to_owned(),
+                            }
+                            .try_to_vec()
+                            .unwrap(),
+                        ),
+                    },
+                    true,
+                );
+            },
+            &engine(),
+            &Some(engine()),
+            &None,
+        );
+    }
+
+    #[test]
+    fn test_fee_on_finish_deposit_per_silo_with_fee_owner() {
+        test_fee_on_finish_deposit_generic(
+            |contract, test_case, proof_key| {
+                contract.finish_deposit(
+                    FinishDepositCallArgs {
+                        new_owner_id: engine(),
+                        amount: test_case.amount,
+                        proof_key,
+                        msg: Some(
+                            TransferCallCallArgs {
+                                receiver_id: engine(),
+                                amount: test_case.amount,
+                                memo: None,
+                                msg: "msg".to_owned(),
+                            }
+                            .try_to_vec()
+                            .unwrap(),
+                        ),
+                    },
+                    true,
+                );
+            },
+            &engine(),
+            &Some(engine()),
+            &Some(fee_owner()),
+        );
+    }
+
     fn create_contract() -> EthConnectorContract {
-        let prover_account = "prover.near".parse().unwrap();
-        let eth_custodian_address = Address::from_array([0xab; 20]);
+        let prover_account = prover();
+        let eth_custodian_address = eth_custodian();
         let metadata = FungibleTokenMetadata {
             spec: FT_METADATA_SPEC.to_string(),
             name: "Ether".to_string(),
@@ -719,7 +1310,7 @@ mod tests {
             reference_hash: None,
             decimals: 18,
         };
-        let account_with_access_right = "engine.near".parse().unwrap();
+        let account_with_access_right = engine();
         let owner_id = "owner.near".parse().unwrap();
         EthConnectorContract::new(
             prover_account,

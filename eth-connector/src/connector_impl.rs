@@ -38,7 +38,7 @@ pub struct FinishDepositCallArgs {
 }
 
 /// withdraw result for eth-connector
-#[derive(BorshSerialize, BorshDeserialize)]
+#[derive(BorshSerialize, BorshDeserialize, Debug, PartialEq, Eq)]
 pub struct WithdrawResult {
     pub amount: Balance,
     pub recipient_id: Address,

@@ -1,3 +1,4 @@
+use crate::fee::{Fee, FeeType};
 use crate::{connector_impl::FinishDepositCallArgs, Proof, VerifyProofArgs, WithdrawResult};
 use aurora_engine_types::types::Address;
 use near_contract_standards::storage_management::StorageBalance;
@@ -8,6 +9,23 @@ use near_sdk::{
 #[ext_contract(ext_deposit)]
 pub trait Deposit {
     fn deposit(&mut self, #[serializer(borsh)] raw_proof: Proof) -> Promise;
+}
+
+#[ext_contract(ext_fee_manage)]
+pub trait FeeManagement {
+    fn get_deposit_fee_per_silo(&self, silo: Option<AccountId>) -> Option<Fee>;
+    fn get_withdraw_fee_per_silo(&self, silo: Option<AccountId>) -> Option<Fee>;
+    fn get_fee_owner(&self) -> AccountId;
+    fn calculate_fee_amount(
+        &self,
+        amount: U128,
+        fee_type: FeeType,
+        silo: Option<AccountId>,
+    ) -> U128;
+    fn set_deposit_fee_per_silo(&mut self, silo: Option<AccountId>, fee: Option<Fee>);
+    fn set_withdraw_fee_per_silo(&mut self, silo: Option<AccountId>, fee: Option<Fee>);
+    fn set_fee_owner(&mut self, owner: Option<AccountId>);
+    fn claim_fee(&mut self, amount: U128, receiver_id: Option<AccountId>);
 }
 
 #[ext_contract(ext_withdraw)]
