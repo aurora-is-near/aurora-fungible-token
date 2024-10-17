@@ -20,6 +20,9 @@ use near_contract_standards::fungible_token::metadata::{
 use near_contract_standards::fungible_token::receiver::ext_ft_receiver;
 use near_contract_standards::fungible_token::resolver::{ext_ft_resolver, FungibleTokenResolver};
 use near_contract_standards::fungible_token::FungibleToken;
+use near_contract_standards::storage_management::{
+    StorageBalance, StorageBalanceBounds, StorageManagement,
+};
 use near_plugins::{
     access_control, access_control_any, pause, AccessControlRole, AccessControllable, Pausable,
     Upgradable,
@@ -115,7 +118,7 @@ impl EthConnectorContract {
 
     // Register user and calculate counter
     fn register_if_not_exists(&mut self, account: &AccountId) {
-        if !self.ft.accounts.contains_key(account) {
+        if self.ft.account_storage_usage == 0 && !self.ft.accounts.contains_key(account) {
             self.ft.internal_register_account(account);
         }
     }
@@ -339,7 +342,7 @@ impl FungibleTokenCore for EthConnectorContract {
     #[payable]
     #[pause(except(roles(Role::DAO)))]
     fn ft_transfer(&mut self, receiver_id: AccountId, amount: U128, memo: Option<String>) {
-        self.ft.storage_deposit(Some(receiver_id.clone()), None);
+        self.register_if_not_exists(&receiver_id);
         self.ft.ft_transfer(receiver_id, amount, memo);
     }
 
@@ -358,7 +361,7 @@ impl FungibleTokenCore for EthConnectorContract {
             "More gas is required"
         );
         let sender_id = env::predecessor_account_id();
-        self.ft.storage_deposit(Some(receiver_id.clone()), None);
+        self.register_if_not_exists(&receiver_id);
         self.internal_ft_transfer_call(sender_id, receiver_id, amount, memo, msg)
     }
 
@@ -388,7 +391,7 @@ impl EngineFungibleToken for EthConnectorContract {
         memo: Option<String>,
     ) {
         self.assert_aurora_engine_access_right();
-        self.ft.storage_deposit(Some(receiver_id.clone()), None);
+        self.register_if_not_exists(&receiver_id);
 
         assert_one_yocto();
         let amount: Balance = amount.into();
@@ -413,7 +416,7 @@ impl EngineFungibleToken for EthConnectorContract {
             env::prepaid_gas() > GAS_FOR_FT_TRANSFER_CALL,
             "More gas is required"
         );
-        self.ft.storage_deposit(Some(receiver_id.clone()), None);
+        self.register_if_not_exists(&receiver_id);
         self.internal_ft_transfer_call(sender_id, receiver_id, amount, memo, msg)
     }
 }
@@ -579,7 +582,42 @@ impl FungibleTokenResolver for EthConnectorContract {
     }
 }
 
-near_contract_standards::impl_fungible_token_storage!(EthConnectorContract, ft);
+#[near_bindgen]
+impl StorageManagement for EthConnectorContract {
+    #[payable]
+    fn storage_deposit(
+        &mut self,
+        account_id: Option<AccountId>,
+        registration_only: Option<bool>,
+    ) -> StorageBalance {
+        self.ft.storage_deposit(account_id, registration_only)
+    }
+
+    #[payable]
+    fn storage_withdraw(&mut self, amount: Option<U128>) -> StorageBalance {
+        self.ft.storage_withdraw(amount)
+    }
+
+    #[payable]
+    fn storage_unregister(&mut self, force: Option<bool>) -> bool {
+        self.ft.internal_storage_unregister(force).is_some()
+    }
+
+    fn storage_balance_bounds(&self) -> StorageBalanceBounds {
+        self.ft.storage_balance_bounds()
+    }
+
+    fn storage_balance_of(&self, account_id: AccountId) -> Option<StorageBalance> {
+        if self.ft.account_storage_usage == 0 {
+            Some(StorageBalance {
+                total: 0.into(),
+                available: 0.into(),
+            })
+        } else {
+            self.ft.storage_balance_of(account_id)
+        }
+    }
+}
 
 #[near_bindgen]
 impl FungibleTokenMetadataProvider for EthConnectorContract {
